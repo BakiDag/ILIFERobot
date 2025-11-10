@@ -1,5 +1,5 @@
 # ILIFERobot
-All the hard work was done by https://github.com/ksya/ILIFERobot, I merely dabbled with the code at an extremely amateur level to add:
+All the hard work was done by https://github.com/ksya/ILIFERobot and https://github.com/blakadder/ILIFERobot, I merely dabbled with the code at an extremely amateur level to add:
 
 - MQTT LWT topic for availability
 - add hostname definition
