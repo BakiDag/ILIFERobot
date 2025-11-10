@@ -13,16 +13,16 @@
 const int sleepTime = 50; //ms
 const int publishStatusTimer = 60000; //ms
 
-const char* WiFi_SSID = "<ssid>"; // LAN
-const char* WiFi_PW = "<pass>>";
+const char* WiFi_SSID = "ssid"; // LAN
+const char* WiFi_PW = "password";
 const char* AP_SSID = "ilife_upgrade"; // AP and UDP clients
 const char* AP_PW = "123456";
 
 const char* devicename = "ilife-vacuum";
-const char* mqtt_server = "<broker-ip>>";
+const char* mqtt_server = "broker-ip";
 const char* mqtt_client = devicename;
-const char* mqtt_user = "<mqtt_username>";
-const char* mqtt_pass = "<mqtt_pass>";
+const char* mqtt_user = "mqtt_username";
+const char* mqtt_pass = "mqtt_password";
 const char* willTopic = "ilife-vacuum/LWT";
 const char* inTopic = "ilife-vacuum/command";
 const char* stateTopic = "ilife-vacuum/state";
