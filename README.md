@@ -66,7 +66,7 @@ Compile and upload the software to your NodeMCU
 
 After that, there will be a Web UI available. It will also broadcast status on MQTT topic "ILIFERobot/state". Commands can be send on topic "ILIFERobot/command". For more information, see the Home-Assistant config.
 
-![Web UI of the smart Ilife Robot](https://github.com/ksya/ILIFERobot/raw/master/images/webui.png)
+![Web UI of the smart Ilife Robot](https://github.com/BakiDag/ILIFERobot/blob/master/images/NewWebui.png)
 
 # Other findings
 I couldn't figure out how to read out digital signals, but if anyone wants to try, you can search the documentation of the CPU. For the ILIFE V5s it is a STM32F030R8.
