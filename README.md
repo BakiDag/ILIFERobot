@@ -56,9 +56,11 @@ Be sure to protect the NodeMCU from touching the metal plate. Insulate the plate
 # Software installation
 Change the lines in ILIFERobot.ino to match your WiFi credentials and MQTT server:
 
-    const char* WiFi_SSID = "your_ssid"; // LAN
-    const char* WiFi_PW = "your_password";
-    const char* mqtt_server = "192.168.5.7";
+    const char* WiFi_SSID = "YourSSID"; // LAN
+    const char* WiFi_PW = "123456";
+    const char* mqtt_server = "192.168.178.2";
+    const char* mqtt_user = "MqttUserName";
+    const char* mqtt_pass = "password";
 
 Compile and upload the software to your NodeMCU 
 
