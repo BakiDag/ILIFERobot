@@ -42,6 +42,14 @@ g{cursor: pointer;} g{user-select:none;-moz-user-select:none;} g.btn:active{opac
   display: block;
   margin: 5px;
 }
+.status-box {
+  margin-top: 15px;
+  padding: 10px;
+  border-radius: 5px;
+  font-size: 16px;
+  font-weight: bold;
+  text-align: center;
+}
 </style>
 </head><body>
 <div id="main">
@@ -118,13 +126,79 @@ g{cursor: pointer;} g{user-select:none;-moz-user-select:none;} g.btn:active{opac
 </g>
 </g>
 </svg>
-
 <h2>Message</h2>
 <p id="message">-</p>
+
+<div id="batteryStatus" style="margin-top:10px; font-size:18px;">
+  🔋 Akku: <span id="batteryPercent">--</span>% (<span id="batteryVoltage">--</span> V)
+</div>
+
+<div id="robotStatus" class="status-box" style="background-color:#e8f4f8;">
+  Status: <span id="statusText">--</span>
+</div>
+
+<div id="errorStatus" class="status-box" style="background-color:#ffe6e6; color:#cc0000; display:none;">
+  ⚠️ <span id="errorText"></span>
+</div>
 
 <a class="pagebtn" href="/firmware">Upload new firmware</a>
 <a class="pagebtn" onclick="action('reboot')">Reboot ESP</a>
 </div>
+
+<script>
+async function updateBattery() {
+  try {
+    const response = await fetch('/battery');
+    const data = await response.json();
+    document.getElementById('batteryPercent').textContent = Math.round(data.percent);
+    document.getElementById('batteryVoltage').textContent = data.voltage.toFixed(2);
+  } catch (e) {
+    console.error('Battery fetch error:', e);
+  }
+}
+
+async function updateStatus() {
+  try {
+    const response = await fetch('/status');
+    const data = await response.json();
+    const statusText = data.status;
+    
+    document.getElementById('statusText').textContent = statusText;
+    
+    const errorDiv = document.getElementById('errorStatus');
+    const errorTextSpan = document.getElementById('errorText');
+    
+    if (statusText === 'Error' || statusText.includes('Stuck')) {
+      errorTextSpan.textContent = statusText;
+      errorDiv.style.display = 'block';
+    } else {
+      errorDiv.style.display = 'none';
+    }
+    
+    const statusDiv = document.getElementById('robotStatus');
+    if (statusText === 'Charging') {
+      statusDiv.style.backgroundColor = '#d4edda';
+    } else if (statusText === 'Cleaning') {
+      statusDiv.style.backgroundColor = '#cfe2ff';
+    } else if (statusText === 'Docked') {
+      statusDiv.style.backgroundColor = '#e2e3e5';
+    } else {
+      statusDiv.style.backgroundColor = '#e8f4f8';
+    }
+    
+  } catch (e) {
+    console.error('Status fetch error:', e);
+  }
+}
+
+setInterval(function() {
+  updateBattery();
+  updateStatus();
+}, 5000);
+
+updateBattery();
+updateStatus();
+</script>
 </body>
 </html>
 )=====";
