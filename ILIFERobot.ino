@@ -1,28 +1,48 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266mDNS.h>
-//#include <WiFiUdp.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266HTTPUpdateServer.h>
+#define MQTT_MAX_PACKET_SIZE 512
 #include <PubSubClient.h>
 #include "Structs.h"
 #include <ArduinoJson.h>
 #include <time.h>
 #include "htmlindex.h"
+#include "ir_buttons.h"
 
+// =======================
+// Forward Declarations
+// =======================
+float calcBattery(boolean returnPercent);
+bool isCharging();
+bool isDocked();
+String getStatusText();
+void SendIRCode(IRbutton irbutton);
+void publishCalibrationMeasurement(const char* eventType);  // ← NEU HINZUFÜGEN
 
 const int sleepTime = 50; //ms
 const int publishStatusTimer = 60000; //ms
+const uint8_t dockPin = D0; // D0 = GPIO16
+// --- Kalibrierungs-Logging Globals ---
+unsigned long lastCleaningSnapshot = 0;        // Zeit für 5min snapshots während Reinigung
+int lastLoggedADCThreshold = -1;               // für 10-ADC-Punkte Schwellwert-Logging
+Status prevRobotStatus = S_BOOTING;            // für Statuswechsel-Detection
+unsigned long ledChangeStableAt = 0;           // für debounce in checkAndLogLedChanges
+int pendingLedCount = -1;
+const unsigned long LED_DEBOUNCE_MS = 5000;    // 5 Sekunden Stabilitätszeit
+const unsigned long CLEANING_SNAPSHOT_MS = 5UL * 60UL * 1000UL; // 5 Minuten
+int lastADCSample = -1;                        // für Ausreißerprüfung
 
-const char* WiFi_SSID = "ssid"; // LAN
-const char* WiFi_PW = "password";
+const char* WiFi_SSID = "YourSSID"; // LAN
+const char* WiFi_PW = "123456";
 const char* AP_SSID = "ilife_upgrade"; // AP and UDP clients
 const char* AP_PW = "123456";
 
-const char* devicename = "ilife-vacuum";
-const char* mqtt_server = "broker-ip";
+const char* devicename = "ilifeV5sPro";
+const char* mqtt_server = "192.168.178.2";
 const char* mqtt_client = devicename;
-const char* mqtt_user = "mqtt_username";
-const char* mqtt_pass = "mqtt_password";
+const char* mqtt_user = "MqttUserName";
+const char* mqtt_pass = "password";
 const char* willTopic = "ilife-vacuum/LWT";
 const char* inTopic = "ilife-vacuum/command";
 const char* stateTopic = "ilife-vacuum/state";
@@ -34,12 +54,16 @@ const char* update_path = "/firmware";
 const char* update_username = "admin";
 const char* update_password = "admin";
 
+#define FIRMWARE_VERSION "v2.0_ADC_FIX"
 #define IRPin       4 //pin D2, pin that is used for sending the IR signals
 #define statusPin1  14 // pin D5, input pin for robot status (from led signal)
 #define statusPin2  5 // pin D1, input pin for robot status (from led signal)
 #define statusPin3  12 // pin D6, input pin for robot status (from led signal)
 #define dockPin     16 // pin D0, input pin for dock contact
 #define batteryPin  A0
+
+
+
 
 const IRbutton rStart = {"start", {8850,4500, 500,600, 500,600, 500,600, 500,600, 500,600, 500,600, 500,1700, 550,600, 500,1700, 500,600, 500,1700, 500,600, 500,1750, 500,600, 500,1700, 500,600, 500,600, 500,600, 500,1750, 500,600, 500,600, 500,600, 500,1700, 500,600, 500,1750, 500,1700, 500,600, 500,1750, 500,1700, 500,1700, 500,600, 500,1750, 500}}; // NEC 2AA22DD
 const IRbutton rUp =    {"up", {8850,4500, 500,600, 500,600, 500,600, 500,600, 500,600, 500,600, 500,1700, 500,600, 500,1750, 500,600, 500,1700, 500,600, 500,1750, 500,600, 500,1700, 500,600, 500,600, 500,1750, 500,600, 500,1700, 500,600, 500,1700, 550,550, 550,1700, 500,1700, 550,600, 500,1700, 500,600, 500,1700, 500,600, 500,1750, 500,600, 500}};  // NEC 2AA55AA
@@ -63,6 +87,7 @@ PubSubClient mqtt(espClient);
 
 Status robotStatus = S_BOOTING;
 bool fanPower = false; //0=normal, 1=max
+
 unsigned long lastStatusUpdate = 0;
 unsigned long lastStatusPinUpdate = 0;
 unsigned int stuckCount = 0;
@@ -74,12 +99,25 @@ Battery bat;
 
 time_t boot_time; //stores boot time
 
+// LED-Status-Tracking
+int lastLedCount = -1;
+unsigned long lastLedChangeTime = 0;
+bool led1LastState = false;
+bool led2LastState = false;
+bool led3LastState = false;
+
 byte activeSockets, retryCounter, retries = 20;
 boolean WiFiUp = false; // Wifi flag
 unsigned long connectedMillis;
 // const unsigned int localPort = 8888;
 
+
+
 void setup() {
+  Serial.begin(115200);
+  Serial.println("\n\n=================================");
+  Serial.println("FIRMWARE VERSION: " FIRMWARE_VERSION);
+  Serial.println("=================================\n");
   Serial.begin(115200);
   Serial.println();
   Serial.println("Booting Sketch...");
@@ -94,8 +132,7 @@ void setup() {
   
   setupWifi();
 
-  mqtt.setServer(mqtt_server, 1883);
-  mqtt.setCallback(callback);
+  setupMQTT();
   
   setupHTTP();
 
@@ -109,7 +146,72 @@ void setup() {
 
 }
  
+ // ------------------------------------------------
+// Kalibrierungs-Messung publizieren
+// ------------------------------------------------
+void publishCalibrationMeasurement(const char* eventType) {
+  StaticJsonBuffer<512> jb;
+  JsonObject& m = jb.createObject();
+
+  int adcRaw = analogRead(A0);
+  float voltage_scaled = calcBattery(false); // deine aktuelle Skala (7.x)
+  float percent = calcBattery(true);
+  
+// LED-Status auslesen (statusPin1/2/3 sind #defines, keine Variablen!)
+int ledCount = (digitalRead(statusPin1) == HIGH ? 1 : 0)
+             + (digitalRead(statusPin2) == HIGH ? 1 : 0)
+             + (digitalRead(statusPin3) == HIGH ? 1 : 0);
+			 
+  // Basismesswerte
+  m["event"] = eventType;
+  m["ADC_Raw"] = adcRaw;
+  m["Battery_Voltage_scaled"] = (float)round(100 * voltage_scaled) / 100;
+  m["Battery_Level"] = (int)round(percent);
+  m["LED_Count"] = ledCount;
+  m["LED1"] = digitalRead(statusPin1) == HIGH;
+  m["LED2"] = digitalRead(statusPin2) == HIGH;
+  m["LED3"] = digitalRead(statusPin3) == HIGH;
+
+ // Status + Kontext (robotStatus ist bereits global definiert)
+ 
+  const char* s;
+  switch(robotStatus) {
+    case S_BOOTING: s = "booted"; break;
+    case S_SLEEP: s = "sleep"; break;
+    case S_IDLE: s = "idle"; break;
+    case S_BUSY: s = "cleaning"; break;
+    case S_STUCK: s = "stuck"; break;
+    case S_DOCKED: s = "docked"; break;
+    case S_GOING_HOME: s = "returning"; break;
+    default: s = "unknown"; break;
+  }
+  m["Status"] = s;
+  m["Charging"] = isCharging();
+  m["Docked"] = isDocked();
+  m["Uptime_ms"] = millis();
+  m["timestamp_rel_ms"] = millis();
+
+  // Metadaten
+  m["confidence"] = "unknown";
+  m["note"] = "";
+
+  // Senden
+  char buf[600];
+  m.printTo(buf, sizeof(buf));
+  mqtt.publish("ilife-vacuum/calibration/measurement", buf, false);
+
+  // Debug
+  char dbg[160];
+  snprintf(dbg, sizeof(dbg), "CAL_MEAS %s ADC:%d LED:%d %.2fV %d%%", 
+           eventType, adcRaw, ledCount, voltage_scaled, (int)round(percent));
+  mqtt.publish(outTopic_debug, dbg, false);
+}
+
+ 
+ 
 void loop() {
+	mqttLoop();
+
   if (!mqtt.connected()) {
     reconnect();
   }
@@ -119,14 +221,83 @@ void loop() {
   server.handleClient();
   mqtt.loop();
   checkLedStatus();
+  
+  // LED-Status überwachen und Snapshots bei Änderungen senden
+  static unsigned long lastLedCheck = 0;
+  if (millis() - lastLedCheck > 500) {  // Alle 500ms prüfen
+    lastLedCheck = millis();
+    checkAndLogLedChanges();  // Diese Funktion macht alles: Erkennung + Snapshot
+	// --- Schwellwert-Logging alle 10 ADC-Punkte ---
+int adcRawNow = analogRead(A0);
+int adcThreshold = (adcRawNow / 10) * 10; // z.B. 473 -> 470
+if (adcThreshold != lastLoggedADCThreshold) {
+  lastLoggedADCThreshold = adcThreshold;
+  publishCalibrationMeasurement("adc_threshold");
+
+  // schnelle Sprünge -> Warnung
+  if (lastADCSample != -1 && abs(adcRawNow - lastADCSample) > 25) {
+    StaticJsonBuffer<200> jb;
+    JsonObject& w = jb.createObject();
+    w["type"] = "sudden_jump";
+    w["ADC_now"] = adcRawNow;
+    w["ADC_prev"] = lastADCSample;
+    char wb[300];
+    w.printTo(wb);
+    mqtt.publish("ilife-vacuum/calibration/warning", wb, false);
+  }
+  lastADCSample = adcRawNow;
+}
+
+// --- Zeitbasiertes Logging während Reinigung (alle 5 Minuten) ---
+if (robotStatus == S_BUSY) {
+  if (millis() - lastCleaningSnapshot >= CLEANING_SNAPSHOT_MS) {
+    lastCleaningSnapshot = millis();
+    publishCalibrationMeasurement("cleaning_periodic");
+  }
+} else {
+  // reset timer wenn nicht reinigen
+  lastCleaningSnapshot = millis();
+}
+
+  }
+  
   delay(sleepTime);
 }
 
+void checkAndLogLedChanges() {
+  bool l1 = digitalRead(statusPin1) == HIGH;
+  bool l2 = digitalRead(statusPin2) == HIGH;
+  bool l3 = digitalRead(statusPin3) == HIGH;
+  int currentLedCount = (l1 ? 1 : 0) + (l2 ? 1 : 0) + (l3 ? 1 : 0);
+
+  if (currentLedCount != lastLedCount) {
+    // neue Anzahl erkannt -> Warte auf Stabilität (Debounce)
+    if (pendingLedCount != currentLedCount) {
+      pendingLedCount = currentLedCount;
+      ledChangeStableAt = millis();
+      return;
+    }
+    // wenn stabil >= debounce
+    if (millis() - ledChangeStableAt >= LED_DEBOUNCE_MS) {
+      lastLedCount = currentLedCount;
+      led1LastState = l1;
+      led2LastState = l2;
+      led3LastState = l3;
+      lastLedChangeTime = millis();
+
+      // Snapshot für LED-Wechsel
+      publishCalibrationMeasurement("led_change");
+
+      // reset pending
+      pendingLedCount = -1;
+    }
+  } else {
+    // keine Änderung: pending zurücksetzen
+    pendingLedCount = -1;
+  }
+}
 
 
-/* 
- *  Functions 
-*/
 void setupWifi() {
   // Connect to WiFi network
   Serial.print("Connecting to ");
@@ -153,6 +324,7 @@ void setupWifi() {
   connectWiFi();
   
 }
+
 void connectWiFi() {
   if (WiFiUp) {
     byte w8 = 0;
@@ -177,6 +349,7 @@ void connectWiFi() {
 //  if (UDP.begin(localPort)) Serial.printf("Broadcasting UDP on %s AP with IP address %s port %d\r\n", AP_SSID, WiFi.softAPIP().toString().c_str(), localPort);
 //  else Serial.println("*** Error setting up UDP\r\n");
 }
+
 
 void reconnectWifi() {
   connectedMillis = millis(); // update
@@ -241,15 +414,13 @@ String printpulses(IRbutton irbutton, boolean printSerial)
 
 void SendIRCode(IRbutton irbutton)
 {
-  int arraySize = sizeof(irbutton.signal) / 4; //sizeof(irbutton.signal) / sizeof(unsigned int)
+  int arraySize = sizeof(irbutton.signal) / 4;
   int i;
-  //printpulses(irbutton, true);
-  
-  noInterrupts();  // this turns off any background interrupts
+  noInterrupts();
   for (i = 0; i < arraySize/2; i++) {
-    digitalWrite(IRPin, LOW);  // this takes about 3 microseconds to happen
+    digitalWrite(IRPin, LOW);
     delayMicroseconds(irbutton.signal[i * 2] - 3);
-    digitalWrite(IRPin, HIGH);   // this also takes about 3 microseconds
+    digitalWrite(IRPin, HIGH);
     delayMicroseconds(irbutton.signal[i * 2 + 1] - 3);
   }
   if(arraySize % 2 != 0) {
@@ -259,11 +430,11 @@ void SendIRCode(IRbutton irbutton)
   }
   interrupts();
   
-  //mqtt feedback
   char command[20];
   sprintf(command, "IR %s", irbutton.name);
   mqtt.publish(outTopic_debug, command);
 }
+
 
 void SendIRCode_long(IRbutton_long irbutton)
 {
@@ -333,35 +504,47 @@ void checkLedStatus() {
 
 boolean calculateStatus() {
   Status newStatus;
-  
-  if((led1.ratio > 0.4 and led1.ratio < 0.55) and (led2.ratio > 0.4 and led2.ratio < 0.55) and (led3.ratio > 0.4 and led3.ratio < 0.55)) {
+
+  if ((led1.ratio > 0.4 && led1.ratio < 0.55) &&
+      (led2.ratio > 0.4 && led2.ratio < 0.55) &&
+      (led3.ratio > 0.4 && led3.ratio < 0.55)) {
     stuckCount++;
   }
-  //led is low when it is on
-  if(isDocked())
+
+  // LED ist LOW, wenn sie an ist
+  if (isDocked())
     newStatus = S_DOCKED;
-  else if(led1.isHigh and led2.isHigh and led3.isHigh)
+  else if (led1.isHigh && led2.isHigh && led3.isHigh)
     newStatus = S_SLEEP;
-  else if(led1.isHigh and led2.isLow and led3.isBlinking || led1.isBlinking and led2.isLow and led3.isHigh || led1.isHigh and led2.isLow and led3.isHigh )
+  else if ((led1.isHigh && led2.isLow && led3.isBlinking) ||
+           (led1.isBlinking && led2.isLow && led3.isHigh) ||
+           (led1.isHigh && led2.isLow && led3.isHigh))
     newStatus = S_BUSY;
-  else if(led1.isHigh and led2.isBlinking and led3.isHigh)
+  else if (led1.isHigh && led2.isBlinking && led3.isHigh)
     newStatus = S_GOING_HOME;
-   else if(stuckCount > 15)
+  else if (stuckCount > 15)
     newStatus = S_STUCK;
   else
     newStatus = S_IDLE;
 
-  if(robotStatus != newStatus) {
+  if (robotStatus != newStatus) {
+    Status old = robotStatus;
     robotStatus = newStatus;
-    
-    if(newStatus != S_STUCK)
+
+    // Snapshot: Motor wurde ausgeschaltet / Reinigung beendet
+    if (old == S_BUSY && newStatus != S_BUSY) {
+      publishCalibrationMeasurement("motor_off_return");
+    }
+
+    if (newStatus != S_STUCK)
       stuckCount = 0;
-      
+
     return true;
   }
-  else
-    return false;
+
+  return false;  // <– war vorher fehlend
 }
+
 
 void publishState() {
   const char* stateName;
@@ -387,8 +570,10 @@ void publishState() {
 }
 
 void publishStatus() {
+
+  Serial.println("[DEBUG] publishStatus() called - Firmware: " FIRMWARE_VERSION);
   const char* statusName;
-  StaticJsonBuffer<200> jsonBuffer;
+  StaticJsonBuffer<300> jsonBuffer;
   JsonObject& jst = jsonBuffer.createObject();
   
   switch(robotStatus) {
@@ -411,12 +596,71 @@ void publishStatus() {
   jst["Boottime"] = boot_time;
   jst["Signal"] = WifiGetRssiAsQuality(WiFi.RSSI());
   jst["RSSI"] = WiFi.RSSI();
-  
-  char msg[200];
+  jst["ADC_Raw"] = analogRead(A0);
+
+  // LED-Status hinzufügen
+  int ledCount = (digitalRead(statusPin1) == HIGH ? 1 : 0)
+             + (digitalRead(statusPin2) == HIGH ? 1 : 0)
+             + (digitalRead(statusPin3) == HIGH ? 1 : 0);
+jst["LED_Count"] = ledCount;
+
+  jst["LED1"] = digitalRead(statusPin1) == HIGH;
+  jst["LED2"] = digitalRead(statusPin2) == HIGH;
+  jst["LED3"] = digitalRead(statusPin3) == HIGH;
+  char msg[400];  // ← Diese Zeile ändern!
   jst.printTo(msg);
-  mqtt.publish(statusTopic, msg);
+  mqtt.publish(statusTopic, msg, true);  // ← 'true' hinzufügen für retained message
+  Serial.print("[MQTT] Status published: ");
+  Serial.println(msg);
 }
 
+void publishLedSnapshot(int ledCount, bool led1, bool led2, bool led3) {
+  StaticJsonBuffer<400> jsonBuffer;
+  JsonObject& snapshot = jsonBuffer.createObject();
+  
+  // LED-Info
+  snapshot["LED_Count"] = ledCount;
+  snapshot["LED1"] = led1;
+  snapshot["LED2"] = led2;
+  snapshot["LED3"] = led3;
+  
+  // Batterie-Daten
+  int adcRaw = analogRead(A0);
+  float voltage = calcBattery(false);
+  float percent = calcBattery(true);
+  
+  snapshot["ADC_Raw"] = adcRaw;
+  snapshot["Battery_Voltage"] = (float)round(100*voltage)/100;
+  snapshot["Battery_Level"] = (int)round(percent);
+  
+  // Status-Info
+  const char* statusName;
+  switch(robotStatus) {
+    case S_BOOTING: statusName = "booted"; break;
+    case S_SLEEP: statusName = "sleep"; break;
+    case S_IDLE: statusName = "idle"; break;
+    case S_BUSY: statusName = "busy"; break;
+    case S_STUCK: statusName = "stuck"; break;
+    case S_DOCKED: statusName = "docked"; break;
+    case S_GOING_HOME: statusName = "goinghome"; break;
+    default: statusName = "unknown"; break;
+  }
+  snapshot["Status"] = statusName;
+  snapshot["Charging"] = (boolean)isCharging() == true;
+  snapshot["Docked"] = (boolean)isDocked() == true;
+  snapshot["Timestamp"] = millis();
+  
+  // An MQTT senden
+  char msg[400];
+  snapshot.printTo(msg);
+  mqtt.publish("ilife-vacuum/led-snapshot", msg, false);
+  
+  // Debug-Info
+  char debugMsg[150];
+  sprintf(debugMsg, "LED-Wechsel: %d LEDs | ADC: %d | Voltage: %.2fV | Level: %d%%", 
+          ledCount, adcRaw, voltage, (int)round(percent));
+  mqtt.publish("ilife-vacuum/debug", debugMsg, false);
+}
 void publishFanStatus() {
   char msg[10];
   if (fanPower == true) {
@@ -517,45 +761,101 @@ boolean doAction(const char* action) {
   return false;
 };
 
-float calcBattery(boolean returnPercentage) {
-  float maxVolt = 12.41; //450 / 11
-  float minVolt = 10.50;
+// ===================================================================
+// calcBattery - OPTIMIERTE VERSION basierend auf echten Messdaten
+// ===================================================================
+float calcBattery(boolean returnPercent) {
+  // ADC-Wert einlesen
+  int adcValue = analogRead(A0);
   
-  int value = analogRead(A0);
-  float voltage = (float)value * (12.22/933); // 11 * 3.3 / 1024;
+  // Glättung mit Rolling Average (optional, verbessert Stabilität)
+  static float adcBuffer[8] = {0};
+  static int bufPos = 0;
+  adcBuffer[bufPos] = adcValue;
+  bufPos = (bufPos + 1) % 8;
   
-  bat.voltageBuffer[bat.valn] = voltage; //add reading to buffer
-  bat.valn++;
-  if(bat.valn == bat.bufferSize)
-    bat.valn = 0;
-
-  //calculate average
-  float sum = 0;
-  size_t bufferSize = 0;
-  for(size_t i = 0; i < bat.bufferSize; i++) {
-    sum += bat.voltageBuffer[i];
-    if(bat.voltageBuffer[i] != 0)
-      bufferSize++;
+  float adcSmoothed = 0;
+  for(int i = 0; i < 8; i++) {
+    adcSmoothed += adcBuffer[i];
   }
-  float meanVoltage = sum/bufferSize;
+  adcSmoothed /= 8.0;
+  
+  // Kalibrierungs-Stützpunkte (aus echten Daten)
+  const int numPoints = 10;
+  const int adcPoints[numPoints] =    {399, 408, 417, 429, 442, 451, 461, 468, 473, 473};
+  const float percentPoints[numPoints] = {25,  35,  45,  55,  65,  75,  85,  95, 100, 100};
+  
+  // Lineare Interpolation zwischen Stützpunkten
+  float batteryPercent = 0;
+  
+  // Unter Minimum (Akku leer)
+  if(adcSmoothed <= adcPoints[0]) {
+    batteryPercent = percentPoints[0];
+  }
+  // Über Maximum (Akku voll)
+  else if(adcSmoothed >= adcPoints[numPoints-1]) {
+    batteryPercent = percentPoints[numPoints-1];
+  }
+  // Interpolation zwischen Punkten
+  else {
+    for(int i = 0; i < numPoints - 1; i++) {
+      if(adcSmoothed >= adcPoints[i] && adcSmoothed <= adcPoints[i+1]) {
+        // Lineare Interpolation
+        float ratio = (adcSmoothed - adcPoints[i]) / (float)(adcPoints[i+1] - adcPoints[i]);
+        batteryPercent = percentPoints[i] + ratio * (percentPoints[i+1] - percentPoints[i]);
+        break;
+      }
+    }
+  }
+  
+  // Rückgabe: Prozent oder Spannung
+  if(returnPercent) {
+    return batteryPercent;
+  } else {
+    // Voltage aus ADC berechnen (ADC * Spannungsteiler-Faktor)
+    // Kalibrierung: 473 ADC = 7.70V → Faktor = 7.70 / 473 = 0.01628
+    float voltage = adcSmoothed * 0.01628;
+    return voltage;
+  }
+}
 
-  //calculate percentage
-  float percentage = (meanVoltage-minVolt)/(maxVolt-minVolt)*100;
-  if(meanVoltage < minVolt)
-    percentage = 0;
-  if(meanVoltage > maxVolt)
-    percentage = 100;
-    
-  if(returnPercentage)
-    return percentage;
-  else
-    return meanVoltage;
+String getStatusText() {
+  switch(robotStatus) {
+    case S_BUSY:
+      return "Cleaning";
+    case S_DOCKED:
+      if(isCharging()) {
+        return "Charging";
+      } else {
+        return "Docked";
+      }
+    case S_SLEEP:
+      return "Sleeping";
+    case S_IDLE:
+      return "Idle";
+    case S_STUCK:
+      return "Stuck - Help needed!";
+    case S_GOING_HOME:
+      return "Returning Home";
+    case S_BOOTING:
+      return "Booting...";
+    default:
+      return "Unknown";
+  }
 }
 
 boolean isDocked() {
-  return (digitalRead(dockPin) == HIGH);  
+  int dockValue = analogRead(dockPin);  // analog messung wegen Pegel
+  return (dockValue > 200);  // Schwelle: ~1.6 V
 }
+
+//boolean isCharging() {
+  //if(isDocked() and led1.isLow and (led2.isBlinking or led3.isBlinking))
+  //return true;
+  //}
+  
 boolean isCharging() {
   if(isDocked() and led1.isLow and (led2.isBlinking or led3.isBlinking))
-  return true;
+    return true;
+  return false; // hinzugefuegt
 }
